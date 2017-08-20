@@ -35,6 +35,8 @@ from .utils import misc_utils as utils
 from .utils import nmt_utils
 from .utils import vocab_utils
 
+from tensorflow.python import debug as tf_debug
+
 utils.check_tensorflow_version()
 
 __all__ = ["train"]
@@ -60,6 +62,12 @@ def create_train_model(model_creator,
     train_src_dataset = tf.contrib.data.TextLineDataset(train_src_file)
     train_tgt_dataset = tf.contrib.data.TextLineDataset(train_tgt_file)
     train_skip_count_placeholder = tf.placeholder(shape=(), dtype=tf.int64)
+
+    # set the batch size to 1 if RL objective is used.
+    if hparams.objective != 'mle':
+        hparams.batch_size = 1
+        hparams.infer_batch_size = 1
+        utils.print_out("RL objective will be used. Setting the batch size to 1.")
 
     train_iterator = iterator_utils.get_iterator(
         train_src_dataset,
@@ -207,9 +215,14 @@ def train(hparams, scope=None, target_session=""):
   infer_sess = tf.Session(
       target=target_session, config=config_proto, graph=infer_graph)
 
+  #train_sess = tf_debug.LocalCLIDebugWrapperSession(train_sess)
+  lm_dir = None
+  if hparams.objective == "pdl" and hparams.lm_model_dir is not None:
+      lm_dir = hparams.lm_model_dir
+
   with train_graph.as_default():
     train_model, global_step = model_helper.create_or_load_model(
-        train_model, model_dir, train_sess, hparams.out_dir, "train")
+        train_model, model_dir, train_sess, hparams.out_dir, "train", lm_dir)
 
   # Summary writer
   summary_writer = tf.summary.FileWriter(
@@ -279,9 +292,14 @@ def train(hparams, scope=None, target_session=""):
           save_on_best=False)
     return dev_scores, test_scores
 
+
+  """
   # First evaluation
   dev_ppl, test_ppl = run_internal_eval(model_dir)
   dev_scores, test_scores = run_external_eval(model_dir)
+  """
+
+  #import pdb; pdb.set_trace()
 
   # This is the training loop.
   step_time, checkpoint_loss, checkpoint_predict_count = 0.0, 0.0, 0.0
@@ -325,7 +343,7 @@ def train(hparams, scope=None, target_session=""):
               train_skip_count_placeholder: 0
           })
       continue
-
+    #import pdb; pdb.set_trace()
     # Write step summary.
     summary_writer.add_summary(step_summary, global_step)
 

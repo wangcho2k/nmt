@@ -55,7 +55,7 @@ class AttentionModel(model.Model):
       self.infer_summary = self._get_infer_summary(hparams)
 
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
+                          source_sequence_length, secondary=False):
     """Build a RNN cell with attention mechanism that can be used by decoder."""
     attention_option = hparams.attention
     attention_architecture = hparams.attention_architecture
@@ -77,7 +77,8 @@ class AttentionModel(model.Model):
     else:
       memory = encoder_outputs
 
-    if self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0:
+    if (self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0) or \
+            (hparams.objective != 'mle' and hparams.beam_width > 0 and secondary):
       memory = tf.contrib.seq2seq.tile_batch(
           memory, multiplier=beam_width)
       source_sequence_length = tf.contrib.seq2seq.tile_batch(

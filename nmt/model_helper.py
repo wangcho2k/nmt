@@ -201,7 +201,7 @@ def gradient_clip(gradients, params, max_gradient_norm):
   return clipped_gradients, gradient_norm_summary
 
 
-def create_or_load_model(model, model_dir, session, out_dir, name):
+def create_or_load_model(model, model_dir, session, out_dir, name, lm_dir=None):
   """Create translation model and initialize or load parameters in session."""
   start_time = time.time()
   latest_ckpt = tf.train.latest_checkpoint(model_dir)
@@ -210,6 +210,17 @@ def create_or_load_model(model, model_dir, session, out_dir, name):
     utils.print_out(
         "  loaded %s model parameters from %s, time %.2fs" %
         (name, latest_ckpt, time.time() - start_time))
+    if lm_dir is not None and model.lm_saver is not None:
+        latest_ckpt = tf.train.latest_checkpoint(lm_dir)
+        #import pdb; pdb.set_trace()
+        model.lm_saver.restore(session, latest_ckpt)
+        utils.print_out(
+            "  loaded language model parameters from %s, time %.2fs" %
+            (latest_ckpt, time.time() - start_time))
+        lm_local_vars = tf.local_variables()
+        lm_local_vars = [k for k in lm_local_vars if "languagemodel" in k.name]
+        session.run(tf.variables_initializer(lm_local_vars))
+
   else:
     utils.print_out("  created %s model with fresh parameters, time %.2fs." %
                     (name, time.time() - start_time))

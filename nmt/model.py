@@ -28,6 +28,8 @@ from . import model_helper
 from .utils import iterator_utils
 from .utils import misc_utils as utils
 
+from .lm.language_model import LM
+
 utils.check_tensorflow_version()
 
 __all__ = ["BaseModel", "Model"]
@@ -92,10 +94,13 @@ class BaseModel(object):
       self.word_count = tf.reduce_sum(
           self.iterator.source_sequence_length) + tf.reduce_sum(
               self.iterator.target_sequence_length)
+      self.sampled_outputs = res[4]
     elif self.mode == tf.contrib.learn.ModeKeys.EVAL:
       self.eval_loss = res[1]
     elif self.mode == tf.contrib.learn.ModeKeys.INFER:
-      self.infer_logits, _, self.final_context_state, self.sample_id = res
+      self.infer_logits = res[0]
+      self.final_context_state = res[2]
+      self.sample_id = res[3]
       self.sample_words = reverse_target_vocab_table.lookup(
           tf.to_int64(self.sample_id))
 
@@ -111,6 +116,10 @@ class BaseModel(object):
     self.global_step = tf.Variable(0, trainable=False)
 
     params = tf.trainable_variables()
+    # If a language model has been created, exclude their parameters from trainables.
+    if self.mode == tf.contrib.learn.ModeKeys.TRAIN and \
+        hparams.objective == "pdl":
+        params = [k for k in params if "languagemodel" not in k.name]
 
     # Gradients and SGD update operation for training the model.
     # Arrage for the embedding vars to appear at the beginning.
@@ -157,7 +166,24 @@ class BaseModel(object):
       self.infer_summary = self._get_infer_summary(hparams)
 
     # Saver
-    self.saver = tf.train.Saver(tf.global_variables())
+    global_variables = tf.global_variables()
+    # If a language model has been created, exclude their parameters from the main saver
+    # then create a new saver for language model weight restore
+    self.lm_saver = None
+    if self.mode == tf.contrib.learn.ModeKeys.TRAIN and \
+        hparams.objective == "pdl":
+        lm_global_variables = [k for k in global_variables if "languagemodel" in k.name]
+        global_variables = [k for k in global_variables if "languagemodel" not in k.name]
+        # The LM graph is placed under the main scope "dynamic_seq2seq"
+        # so we have to trim the name of main scope from variable key
+        # so that the saver can recover the LM weights properly
+        lm_var_list = {}
+        for var in lm_global_variables:
+            key = var.name.replace(scope or "dynamic_seq2seq","")[1:-2] # To trim the device id such as ':0'
+            lm_var_list[key] = var
+        #import pdb; pdb.set_trace()
+        self.lm_saver = tf.train.Saver(lm_var_list)
+    self.saver = tf.train.Saver(global_variables)
 
     # Print trainable variables
     utils.print_out("# Trainable variables")
@@ -222,17 +248,25 @@ class BaseModel(object):
       encoder_outputs, encoder_state = self._build_encoder(hparams)
 
       ## Decoder
-      logits, sample_id, final_context_state = self._build_decoder(
+      logits, target_id, sample_id, final_context_state = self._build_decoder(
           encoder_outputs, encoder_state, hparams)
-
+      ### Secondary decoder for the MRT and PDL objectives
+      ### only needs the predicted sample_id
+      sec_sample_id = None
+      if hparams.objective != 'mle':
+        sec_sample_id = self._build_decoder(
+            encoder_outputs, encoder_state, hparams, secondary=True)[2]
       ## Loss
       if self.mode != tf.contrib.learn.ModeKeys.INFER:
         with tf.device(model_helper.get_device_str(num_layers - 1, num_gpus)):
-          loss = self._compute_loss(logits)
+          if hparams.objective != 'mle' and self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+            loss = self._compute_loss(hparams, logits, target_id, sec_sample_id, final_context_state)
+          else:
+            loss = self._compute_loss(hparams, logits)
       else:
         loss = None
 
-      return logits, loss, final_context_state, sample_id
+      return logits, loss, final_context_state, sample_id, sec_sample_id
 
   @abc.abstractmethod
   def _build_encoder(self, hparams):
@@ -263,7 +297,7 @@ class BaseModel(object):
         mode=self.mode,
         base_gpu=base_gpu)
 
-  def _build_decoder(self, encoder_outputs, encoder_state, hparams):
+  def _build_decoder(self, encoder_outputs, encoder_state, hparams, secondary=False):
     """Build and run a RNN decoder with a final projection layer.
 
     Args:
@@ -296,16 +330,25 @@ class BaseModel(object):
       maximum_iterations = tf.to_int32(tf.round(
           tf.to_float(max_encoder_length) * decoding_length_factor))
 
+    if hparams.objective != 'mle' and secondary:
+        reuse = True
+        if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+            maximum_iterations = hparams.tgt_max_len
+    else:
+        reuse = False
+
     ## Decoder.
-    with tf.variable_scope("decoder") as decoder_scope:
+    with tf.variable_scope("decoder", reuse=reuse) as decoder_scope:
       cell, decoder_initial_state = self._build_decoder_cell(
           hparams, encoder_outputs, encoder_state,
-          iterator.source_sequence_length)
+          iterator.source_sequence_length, secondary=secondary)
+      target_id = None
 
       ## Train or eval
-      if self.mode != tf.contrib.learn.ModeKeys.INFER:
+      if self.mode != tf.contrib.learn.ModeKeys.INFER and not secondary:
         # decoder_emp_inp: [max_time, batch_size, num_units]
         target_input = iterator.target_input
+        target_id = target_input
         if self.time_major:
           target_input = tf.transpose(target_input)
         decoder_emb_inp = tf.nn.embedding_lookup(
@@ -380,13 +423,13 @@ class BaseModel(object):
             scope=decoder_scope)
 
         if beam_width > 0:
-          logits = tf.no_op()
+          logits = tf.stop_gradient(tf.no_op())
           sample_id = outputs.predicted_ids
         else:
           logits = outputs.rnn_output
           sample_id = outputs.sample_id
 
-    return logits, sample_id, final_context_state
+    return logits, target_id, sample_id, final_context_state
 
   def get_max_time(self, tensor):
     time_axis = 0 if self.time_major else 1
@@ -394,7 +437,7 @@ class BaseModel(object):
 
   @abc.abstractmethod
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
+                          source_sequence_length, secondary=False):
     """Subclass must implement this.
 
     Args:
@@ -409,9 +452,12 @@ class BaseModel(object):
     """
     pass
 
-  def _compute_loss(self, logits):
+  def _compute_loss(self, hparams, logits, input_targets=None,
+                    sampled_targets=None, final_context_state=None):
     """Compute optimization loss."""
     target_output = self.iterator.target_output
+    #import pdb; pdb.set_trace()
+
     if self.time_major:
       target_output = tf.transpose(target_output)
     max_time = self.get_max_time(target_output)
@@ -422,8 +468,89 @@ class BaseModel(object):
     if self.time_major:
       target_weights = tf.transpose(target_weights)
 
+
     loss = tf.reduce_sum(
         crossent * target_weights) / tf.to_float(self.batch_size)
+    if sampled_targets is None:
+        pass
+    else:
+        beam_width = hparams.beam_width
+        if hparams.debug:
+            sampled_targets = tf.Print(sampled_targets,[sampled_targets],summarize=20)
+        sampled_targets = tf.squeeze(tf.stop_gradient(sampled_targets), [1])
+        clip_size = tf.minimum(max_time, tf.shape(sampled_targets)[0])
+        sampled_targets = tf.slice(sampled_targets, [0, 0], [clip_size, -1])
+
+        ## mask for -1 token (indicating not decoded tokens)
+        minus_one_idx = tf.argmax(tf.to_int64(tf.equal(sampled_targets, -1)), axis=0) - 1
+        ## if -1 is not found in the each sentence, the resulting minus_one_idx sould be -1
+        ## in this case, we take care about up to the end of decoded array
+        limit_idx = minus_one_idx + \
+                    (tf.to_int64(clip_size) - 1) * tf.to_int64(tf.equal(minus_one_idx, -1))
+
+        # masking out the -1 values, which makes the NaN output of scores
+        sampled_targets = tf.nn.relu(sampled_targets)
+        if hparams.debug:
+            sampled_targets = tf.Print(sampled_targets,[sampled_targets],summarize=20)
+
+        sampled_logits = tf.tile(tf.slice(logits,[0, 0, 0],[clip_size, -1, -1]),
+                           [1, beam_width, 1])
+
+        rl_crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=sampled_targets, logits=sampled_logits, name="RL_loss")
+
+        utils.print_out("RL loss is being created.")
+
+        #sampled_target_weights = tf.slice(target_weights, [0,0], [clip_size, -1])
+        sampled_target_weights = tf.transpose(
+            tf.sequence_mask(limit_idx, maxlen=clip_size, dtype=logits.dtype))
+        #sampled_target_weights = tf.to_float(sampled_targets)
+        if hparams.debug:
+            sampled_target_weights = tf.Print(sampled_target_weights,[sampled_target_weights])
+
+        # Build the language model if dual learning objective is being used
+        if hparams.objective == "pdl":
+            hps = LM.get_default_hparams()
+            hps.num_steps = hparams.tgt_max_len
+            hps.batch_size = beam_width
+            hps.vocab_size = hparams.tgt_vocab_size
+            hps.average_params = False
+            hps.num_sampled = 0
+            hps.keep_prob = 1.0
+
+            tgt_eos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.eos)),
+                                 tf.int32)
+
+            pad_size = hparams.tgt_max_len-clip_size
+            lm_x = tf.concat([tf.transpose(sampled_targets),
+                                       tgt_eos_id * tf.ones([beam_width, pad_size], dtype=tf.int32)], 1)
+
+            lm_y = tf.slice(tf.transpose(sampled_targets), [0, 1], [-1, clip_size - 1])
+            lm_y = tf.concat([lm_y,
+                              tgt_eos_id * tf.ones([beam_width, pad_size + 1], dtype=tf.int32)], 1)
+
+            #lm_w = tf.concat([tf.ones([beam_width, clip_size - 1]), tf.zeros([beam_width, pad_size + 1])], 1)
+            lm_w = tf.sequence_mask(limit_idx, maxlen=hparams.tgt_max_len)
+
+            if hparams.debug:
+                lm_x = tf.Print(lm_x,[lm_x],summarize=hps.num_steps*hps.num_steps)
+                lm_y = tf.Print(lm_y, [lm_y], summarize=hps.num_steps * hps.num_steps)
+                lm_w = tf.Print(lm_w, [lm_w], summarize=hps.num_steps * hps.num_steps)
+
+            with tf.variable_scope("languagemodel"):
+                self.langmodel = LM(hps, "eval", "/cpu:0", standardalone=False,
+                                    x_i=lm_x, y_i=lm_y, w_i=lm_w)
+            with tf.control_dependencies([tf.is_nan(self.langmodel.batch_loss)]):
+                score = tf.scalar_mul(hparams.pdl_alpha, tf.stop_gradient(self.langmodel.batch_loss))
+                if hparams.debug:
+                    score = tf.Print(score,[score],summarize=beam_width)
+
+        with tf.control_dependencies([tf.is_nan(rl_crossent)]):
+            rl_losses = tf.reduce_sum(rl_crossent * sampled_target_weights,[0])
+        loss += tf.reduce_mean(rl_losses * score)
+        if hparams.debug:
+            loss = tf.Print(loss,[loss])
+
     return loss
 
   def _get_infer_summary(self, hparams):
@@ -559,7 +686,7 @@ class Model(BaseModel):
     return tf.concat(bi_outputs, -1), bi_state
 
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
+                          source_sequence_length, secondary=False):
     """Build an RNN cell that can be used by decoder."""
     # We only make use of encoder_outputs in attention-based models
     if hparams.attention:
@@ -580,6 +707,9 @@ class Model(BaseModel):
 
     # For beam search, we need to replicate encoder infos beam_width times
     if self.mode == tf.contrib.learn.ModeKeys.INFER and hparams.beam_width > 0:
+      decoder_initial_state = tf.contrib.seq2seq.tile_batch(
+          encoder_state, multiplier=hparams.beam_width)
+    elif hparams.objective != 'mle' and hparams.beam_width > 0 and secondary:
       decoder_initial_state = tf.contrib.seq2seq.tile_batch(
           encoder_state, multiplier=hparams.beam_width)
     else:

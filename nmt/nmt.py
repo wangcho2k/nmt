@@ -73,6 +73,9 @@ def create_hparams():
       decay_factor=FLAGS.decay_factor,
       decay_steps=FLAGS.decay_steps,
       colocate_gradients_with_ops=FLAGS.colocate_gradients_with_ops,
+      objective=FLAGS.objective,
+      lm_model_dir=FLAGS.lm_model_dir,
+      pdl_alpha=FLAGS.pdl_alpha,
 
       # Data constraints
       num_buckets=FLAGS.num_buckets,
@@ -103,6 +106,7 @@ def create_hparams():
       metrics=FLAGS.metrics.split(","),
       log_device_placement=FLAGS.log_device_placement,
       random_seed=FLAGS.random_seed,
+      debug=FLAGS.debug,
   )
 
 
@@ -354,6 +358,11 @@ if __name__ == "__main__":
                       default=True,
                       help=("Whether try colocating gradients with "
                             "corresponding op"))
+  parser.add_argument("--objective", type=str, default="mle", help="mle | mrt | pdl")
+  parser.add_argument("--lm_model_dir", type=str, default=None,
+                      help="Stored language model dir (only works with pdl objective)")
+  parser.add_argument("--pdl_alpha", type=float, default=0.005,
+                      help="Alpha value for the language model reward (only works with pdl objective)")
 
   # data
   parser.add_argument("--src", type=str, default=None,
@@ -474,6 +483,8 @@ if __name__ == "__main__":
                       help="Task id of the worker.")
   parser.add_argument("--num_workers", type=int, default=1,
                       help="Number of workers (inference only).")
+  parser.add_argument("--debug", type="bool", nargs="?", const=False,
+                      default=False, help="Debugging mode (for pdl objective)")
 
   FLAGS, unparsed = parser.parse_known_args()
   tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
