@@ -23,12 +23,14 @@ import abc
 import tensorflow as tf
 
 from tensorflow.python.layers import core as layers_core
+from tensorflow.python.framework import tensor_shape
 
 from . import model_helper
 from .utils import iterator_utils
 from .utils import misc_utils as utils
 
 from .lm.language_model import LM
+from . import beam_search_decoder as patched_beam_search_decoder
 
 utils.check_tensorflow_version()
 
@@ -254,13 +256,15 @@ class BaseModel(object):
       ### only needs the predicted sample_id
       sec_sample_id = None
       if hparams.objective != 'mle':
-        sec_sample_id = self._build_decoder(
-            encoder_outputs, encoder_state, hparams, secondary=True)[2]
+        sec_decoder = self._build_decoder(
+            encoder_outputs, encoder_state, hparams, secondary=True)
+        sec_sample_id = sec_decoder[2]
+        sec_logit = sec_decoder[0]
       ## Loss
       if self.mode != tf.contrib.learn.ModeKeys.INFER:
         with tf.device(model_helper.get_device_str(num_layers - 1, num_gpus)):
           if hparams.objective != 'mle' and self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-            loss = self._compute_loss(hparams, logits, target_id, sec_sample_id, final_context_state)
+            loss = self._compute_loss(hparams, logits, target_id, sec_sample_id, sec_logit)
           else:
             loss = self._compute_loss(hparams, logits)
       else:
@@ -335,7 +339,7 @@ class BaseModel(object):
         if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
             maximum_iterations = hparams.tgt_max_len
     else:
-        reuse = False
+        reuse = None
 
     ## Decoder.
     with tf.variable_scope("decoder", reuse=reuse) as decoder_scope:
@@ -392,7 +396,7 @@ class BaseModel(object):
         end_token = tgt_eos_id
 
         if beam_width > 0:
-          my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
+          my_decoder = patched_beam_search_decoder.BeamSearchDecoder(
               cell=cell,
               embedding=self.embedding_decoder,
               start_tokens=start_tokens,
@@ -423,7 +427,7 @@ class BaseModel(object):
             scope=decoder_scope)
 
         if beam_width > 0:
-          logits = tf.stop_gradient(tf.no_op())
+          logits = final_context_state.log_probs
           sample_id = outputs.predicted_ids
         else:
           logits = outputs.rnn_output
@@ -453,7 +457,7 @@ class BaseModel(object):
     pass
 
   def _compute_loss(self, hparams, logits, input_targets=None,
-                    sampled_targets=None, final_context_state=None):
+                    sampled_targets=None, sec_logit=None):
     """Compute optimization loss."""
     target_output = self.iterator.target_output
     #import pdb; pdb.set_trace()
@@ -475,6 +479,8 @@ class BaseModel(object):
         pass
     else:
         beam_width = hparams.beam_width
+        static_batch_size = hparams.batch_size * beam_width
+
         if hparams.debug:
             sampled_targets = tf.Print(sampled_targets,[sampled_targets],summarize=20)
         sampled_targets = tf.squeeze(tf.stop_gradient(sampled_targets), [1])
@@ -493,11 +499,26 @@ class BaseModel(object):
         if hparams.debug:
             sampled_targets = tf.Print(sampled_targets,[sampled_targets],summarize=20)
 
+        """
         sampled_logits = tf.tile(tf.slice(logits,[0, 0, 0],[clip_size, -1, -1]),
                            [1, beam_width, 1])
 
         rl_crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
             labels=sampled_targets, logits=sampled_logits, name="RL_loss")
+        """
+
+        if beam_width > 1:
+            log_probs = tf.squeeze(tf.negative(sec_logit))
+            log_probs.set_shape(
+                tensor_shape.TensorShape([static_batch_size]))
+            # sample_words = tf.concat(tf.unstack(sample_words, axis=1), axis=0)
+        else:
+            log_probs = tf.reduce_max(tf.transpose(
+                tf.negative(sec_logit), perm=[1, 2, 0]), axis=1)
+            log_probs = tf.to_float(tf.negative(tf.reduce_sum(log_probs, axis=1)))
+            log_probs = tf.squeeze(tf.nn.softmax(sec_logit, dim=-1))
+            log_probs.set_shape(
+                tensor_shape.TensorShape([static_batch_size]))
 
         utils.print_out("RL loss is being created.")
 
@@ -544,10 +565,10 @@ class BaseModel(object):
                 score = tf.scalar_mul(hparams.pdl_alpha, tf.stop_gradient(self.langmodel.batch_loss))
                 if hparams.debug:
                     score = tf.Print(score,[score],summarize=beam_width)
+                score.set_shape(tensor_shape.TensorShape([static_batch_size]))
 
-        with tf.control_dependencies([tf.is_nan(rl_crossent)]):
-            rl_losses = tf.reduce_sum(rl_crossent * sampled_target_weights,[0])
-        loss += tf.reduce_mean(rl_losses * score)
+        with tf.control_dependencies([tf.is_nan(log_probs)]):
+            loss += tf.reduce_mean(log_probs * score)
         if hparams.debug:
             loss = tf.Print(loss,[loss])
 
