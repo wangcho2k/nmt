@@ -1,6 +1,7 @@
 """Utility functions for building models."""
 from __future__ import print_function
 
+import os
 import time
 
 import tensorflow as tf
@@ -9,26 +10,9 @@ from .utils import misc_utils as utils
 
 
 __all__ = [
-    "get_initializer",
     "get_device_str", "create_emb_for_encoder_and_decoder", "create_rnn_cell",
     "gradient_clip", "create_or_load_model", "load_model", "compute_perplexity"
 ]
-
-
-def get_initializer(init_op, seed=None, init_weight=None):
-  """Create an initializer. init_weight is only for uniform."""
-  if init_op == "uniform":
-    assert init_weight
-    return tf.random_uniform_initializer(
-        -init_weight, init_weight, seed=seed)
-  elif init_op == "glorot_normal":
-    return tf.contrib.keras.initializers.glorot_normal(
-        seed=seed)
-  elif init_op == "glorot_uniform":
-    return tf.contrib.keras.initializers.glorot_uniform(
-        seed=seed)
-  else:
-    raise ValueError("Unknown init_op %s" % init_op)
 
 
 def get_device_str(device_id, num_gpus):
@@ -45,7 +29,6 @@ def create_emb_for_encoder_and_decoder(share_vocab,
                                        src_embed_size,
                                        tgt_embed_size,
                                        dtype=tf.float32,
-                                       num_partitions=0,
                                        scope=None):
   """Create embedding matrix for both encoder and decoder.
 
@@ -59,7 +42,6 @@ def create_emb_for_encoder_and_decoder(share_vocab,
     tgt_embed_size: An integer. The embedding dimension for the decoder's
       embedding.
     dtype: dtype of the embedding matrix. Default to float32.
-    num_partitions: number of partitions used for the embedding vars.
     scope: VariableScope for the created subgraph. Default to "embedding".
 
   Returns:
@@ -70,18 +52,7 @@ def create_emb_for_encoder_and_decoder(share_vocab,
     ValueError: if use share_vocab but source and target have different vocab
       size.
   """
-
-  if num_partitions <= 1:
-    partitioner = None
-  else:
-    # Note: num_partitions > 1 is required for distributed training due to
-    # embedding_lookup tries to colocate single partition-ed embedding variable
-    # with lookup ops. This may cause embedding variables being placed on worker
-    # jobs.
-    partitioner = tf.fixed_size_partitioner(num_partitions)
-
-  with tf.variable_scope(
-      scope or "embeddings", dtype=dtype, partitioner=partitioner) as scope:
+  with tf.variable_scope(scope or "embeddings", dtype=dtype) as scope:
     # Share embedding
     if share_vocab:
       if src_vocab_size != tgt_vocab_size:
@@ -93,11 +64,11 @@ def create_emb_for_encoder_and_decoder(share_vocab,
       embedding_encoder = embedding
       embedding_decoder = embedding
     else:
-      with tf.variable_scope("encoder", partitioner=partitioner):
+      with tf.variable_scope("encoder"):
         embedding_encoder = tf.get_variable(
             "embedding_encoder", [src_vocab_size, src_embed_size], dtype)
 
-      with tf.variable_scope("decoder", partitioner=partitioner):
+      with tf.variable_scope("decoder"):
         embedding_decoder = tf.get_variable(
             "embedding_decoder", [tgt_vocab_size, tgt_embed_size], dtype)
 
@@ -240,11 +211,17 @@ def load_model(model, ckpt, session, name):
   return model
 
 
-def create_or_load_model(model, model_dir, session, name):
+def create_or_load_model(model, model_dir, session, hparams,  name):
   """Create translation model and initialize or load parameters in session."""
-  latest_ckpt = tf.train.latest_checkpoint(model_dir)
+  
+  objective = hparams.objective
+  if name == "train" and objective == "mrt":
+    latest_ckpt = tf.train.latest_checkpoint(hparams.best_bleu_dir)
+  else:
+    latest_ckpt = tf.train.latest_checkpoint(model_dir)
+  
   if latest_ckpt:
-    model = load_model(model, latest_ckpt, session, name)
+     model = load_model(model, latest_ckpt, session, name)
   else:
     start_time = time.time()
     session.run(tf.global_variables_initializer())

@@ -16,7 +16,7 @@
 """Utility functions specifically for NMT."""
 from __future__ import print_function
 
-import codecs
+#import codecs
 import time
 
 import tensorflow as tf
@@ -44,10 +44,12 @@ def decode_and_evaluate(name,
 
     start_time = time.time()
     num_sentences = 0
-    with codecs.getwriter("utf-8")(
-        tf.gfile.GFile(trans_file, mode="wb")) as trans_f:
-      trans_f.write("")  # Write empty string to ensure file is created.
-
+    #with codecs.getwriter("utf-8")(
+    #    tf.gfile.GFile(trans_file, mode="w")) as trans_f:
+    #  trans_f.write("")  # Write empty string to ensure file is created.
+    with tf.gfile.GFile(trans_file, mode="w") as trans_f:
+      trans_f.write("")  # Write empty string to ensure file is created.      
+      
       while True:
         try:
           nmt_outputs, _ = model.decode(sess)
@@ -63,7 +65,7 @@ def decode_and_evaluate(name,
                 sent_id,
                 tgt_eos=tgt_eos,
                 bpe_delimiter=bpe_delimiter)
-            trans_f.write((translation + b"\n").decode("utf-8"))
+            trans_f.write("%s\n" % translation)
         except tf.errors.OutOfRangeError:
           utils.print_time("  done, num sentences %d" % num_sentences,
                            start_time)
@@ -99,3 +101,32 @@ def get_translation(nmt_outputs, sent_id, tgt_eos, bpe_delimiter):
     translation = utils.format_bpe_text(output, delimiter=bpe_delimiter)
 
   return translation
+
+
+def get_logprobs(params, indices, batch_size=None, option_size=None):
+  params = tf.expand_dims(params[:,0,:], axis=1)
+  params = tf.transpose(tf.nn.log_softmax(params), perm=[1,0,2])
+
+  if batch_size is None:
+    batch_size = params.get_shape()[0].merge_with(indices.get_shape()[0]).value
+    if batch_size is None:
+      batch_size = tf.shape(indices)[0]
+  if option_size is None:
+    option_size = params.get_shape()[1].value
+    if option_size is None:
+      option_size = tf.shape(params)[1]
+
+  batch_size_times_option_size = batch_size * option_size
+
+  # gather_nd has no gradients implemented
+  batch_time_params = tf.reshape(params, 
+                                 tf.concat([[batch_size_times_option_size], 
+                                            tf.shape(params)[2:]], axis=0))
+  flat_params = tf.reshape(batch_time_params, [-1])
+  indices_into_flat = tf.reshape(indices, [-1])
+  flat_indices = tf.range(0, tf.shape(batch_time_params)[0]) *  tf.shape(batch_time_params)[1] + indices_into_flat
+
+  log_probs =  tf.reshape(tf.gather(flat_params, flat_indices), [batch_size, -1])
+  batch_log_probs = tf.reduce_sum(log_probs, axis=1)
+    
+  return batch_log_probs

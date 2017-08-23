@@ -56,8 +56,12 @@ class AttentionModel(model.Model):
     if self.mode == tf.contrib.learn.ModeKeys.INFER:
       self.infer_summary = self._get_infer_summary(hparams)
 
-  def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
+  def _build_decoder_cell(self, 
+                          hparams, 
+                          encoder_outputs,
+                          encoder_state,
+                          source_sequence_length,
+                          is_second=False):
     """Build a RNN cell with attention mechanism that can be used by decoder."""
     attention_option = hparams.attention
     attention_architecture = hparams.attention_architecture
@@ -79,14 +83,20 @@ class AttentionModel(model.Model):
     else:
       memory = encoder_outputs
 
-    if self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0:
-      memory = tf.contrib.seq2seq.tile_batch(
-          memory, multiplier=beam_width)
-      source_sequence_length = tf.contrib.seq2seq.tile_batch(
-          source_sequence_length, multiplier=beam_width)
-      encoder_state = tf.contrib.seq2seq.tile_batch(
-          encoder_state, multiplier=beam_width)
-      batch_size = self.batch_size * beam_width
+    train_case = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
+    mrt_case = train_case and bool(hparams.objective == 'mrt')
+    infer_case = self.mode == tf.contrib.learn.ModeKeys.INFER
+    if (mrt_case or infer_case) and beam_width > 0:
+      if is_second is False:
+        memory = tf.contrib.seq2seq.tile_batch(
+            memory, multiplier=beam_width)
+        source_sequence_length = tf.contrib.seq2seq.tile_batch(
+            source_sequence_length, multiplier=beam_width)
+        encoder_state = tf.contrib.seq2seq.tile_batch(
+            encoder_state, multiplier=beam_width)
+        batch_size = self.batch_size * beam_width
+      else:
+        batch_size = self.batch_size
     else:
       batch_size = self.batch_size
 

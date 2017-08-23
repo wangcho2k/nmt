@@ -13,20 +13,28 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Basic sequence-to-sequence model with dynamic RNN support."""
+"""
+Basic sequence-to-sequence model with dynamic RNN support.
+"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import abc
 
+
+import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.layers import core as layers_core
+from tensorflow.python.framework import tensor_shape
 
 from . import model_helper
 from .utils import iterator_utils
+from .utils import nmt_utils
 from .utils import misc_utils as utils
+from .scripts import bleu
+from . import beam_search_decoder as patched_beam_search_decoder
 
 utils.check_tensorflow_version()
 
@@ -34,7 +42,8 @@ __all__ = ["BaseModel", "Model"]
 
 
 class BaseModel(object):
-  """Sequence-to-sequence base class.
+  """
+  Sequence-to-sequence base class.
   """
 
   def __init__(self,
@@ -65,6 +74,7 @@ class BaseModel(object):
     self.mode = mode
     self.src_vocab_table = source_vocab_table
     self.tgt_vocab_table = target_vocab_table
+    self.reverse_target_vocab_table = reverse_target_vocab_table
 
     self.src_vocab_size = hparams.src_vocab_size
     self.tgt_vocab_size = hparams.tgt_vocab_size
@@ -73,14 +83,14 @@ class BaseModel(object):
     self.time_major = hparams.time_major
 
     # Initializer
-    initializer = model_helper.get_initializer(
-        hparams.init_op, hparams.random_seed, hparams.init_weight)
+    initializer = tf.random_uniform_initializer(
+        -hparams.init_weight, hparams.init_weight, seed=hparams.random_seed)
     tf.get_variable_scope().set_initializer(initializer)
 
     # Embeddings
     # TODO(ebrevdo): Only do this if the mode is TRAIN?
     self.init_embeddings(hparams, scope)
-    self.batch_size = tf.size(self.iterator.source_sequence_length)
+    self.batch_size = tf.size(self.iterator.source_sequence_length)   
 
     # Projection
     with tf.variable_scope(scope or "build_network"):
@@ -94,7 +104,6 @@ class BaseModel(object):
 
     ## Train graph
     res = self.build_graph(hparams, scope=scope)
-
     if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
       self.train_loss = res[1]
       self.word_count = tf.reduce_sum(
@@ -103,7 +112,7 @@ class BaseModel(object):
     elif self.mode == tf.contrib.learn.ModeKeys.EVAL:
       self.eval_loss = res[1]
     elif self.mode == tf.contrib.learn.ModeKeys.INFER:
-      self.infer_logits, _, self.final_context_state, self.sample_id = res
+      self.infer_logits, _, self.final_context_state, _, self.sample_id = res
       self.sample_words = reverse_target_vocab_table.lookup(
           tf.to_int64(self.sample_id))
 
@@ -181,7 +190,6 @@ class BaseModel(object):
             tgt_vocab_size=self.tgt_vocab_size,
             src_embed_size=hparams.num_units,
             tgt_embed_size=hparams.num_units,
-            num_partitions=hparams.num_embeddings_partitions,
             scope=scope,))
 
   def train(self, sess):
@@ -228,19 +236,28 @@ class BaseModel(object):
     with tf.variable_scope(scope or "dynamic_seq2seq", dtype=dtype):
       # Encoder
       encoder_outputs, encoder_state = self._build_encoder(hparams)
-
       ## Decoder
-      logits, sample_id, final_context_state = self._build_decoder(
-          encoder_outputs, encoder_state, hparams)
+      logits, target_id, sample_id, final_context_state = self._build_decoder(
+          encoder_outputs, encoder_state, hparams, is_second=False)
+      
+      if self.mode == tf.contrib.learn.ModeKeys.TRAIN and hparams.objective == "mrt":
+        ref_logits, _, _, _ = self._build_decoder(
+            encoder_outputs, encoder_state, hparams, is_second=True)    
 
       ## Loss
       if self.mode != tf.contrib.learn.ModeKeys.INFER:
         with tf.device(model_helper.get_device_str(num_layers - 1, num_gpus)):
-          loss = self._compute_loss(logits)
+            if hparams.objective == "mle" or self.mode == tf.contrib.learn.ModeKeys.EVAL:
+                loss = self._compute_crossent_loss(logits)
+            elif hparams.objective == "mrt":
+                loss = self._compute_metric_loss(ref_logits, logits, 
+                                                 target_id, sample_id, hparams)
+            else:
+                raise ValueError("Unknown objective type %s" % hparams.objective)             
       else:
         loss = None
 
-      return logits, loss, final_context_state, sample_id
+      return logits, loss, final_context_state, target_id, sample_id
 
   @abc.abstractmethod
   def _build_encoder(self, hparams):
@@ -256,10 +273,14 @@ class BaseModel(object):
     """
     pass
 
-  def _build_encoder_cell(self, hparams, num_layers, num_residual_layers,
+  def _build_encoder_cell(self, 
+                          hparams, 
+                          num_layers, 
+                          num_residual_layers,
                           base_gpu=0):
-    """Build a multi-layer RNN cell that can be used by encoder."""
-
+    """
+    Build a multi-layer RNN cell that can be used by encoder.
+    """
     return model_helper.create_rnn_cell(
         unit_type=hparams.unit_type,
         num_units=hparams.num_units,
@@ -272,8 +293,9 @@ class BaseModel(object):
         base_gpu=base_gpu,
         single_cell_fn=self.single_cell_fn)
 
-  def _build_decoder(self, encoder_outputs, encoder_state, hparams):
-    """Build and run a RNN decoder with a final projection layer.
+  def _build_decoder(self, encoder_outputs, encoder_state, hparams, is_second=False):
+    """
+    Build and run a RNN decoder with a final projection layer.
 
     Args:
       encoder_outputs: The outputs of encoder for every time step.
@@ -284,10 +306,10 @@ class BaseModel(object):
       A tuple of final logits and final decoder state:
         logits: size [time, batch_size, vocab_size] when time_major=True.
     """
-    tgt_sos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.sos)),
-                         tf.int32)
-    tgt_eos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.eos)),
-                         tf.int32)
+    tgt_sos_id = tf.cast(self.tgt_vocab_table.lookup(
+        tf.constant(hparams.sos)), tf.int32)
+    tgt_eos_id = tf.cast(self.tgt_vocab_table.lookup(
+        tf.constant(hparams.eos)), tf.int32)
 
     num_layers = hparams.num_layers
     num_gpus = hparams.num_gpus
@@ -304,22 +326,29 @@ class BaseModel(object):
       max_encoder_length = tf.reduce_max(iterator.source_sequence_length)
       maximum_iterations = tf.to_int32(tf.round(
           tf.to_float(max_encoder_length) * decoding_length_factor))
+        
+    train_case = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
+    mle_case = train_case and bool(hparams.objective == 'mle')
+    mrt_case = train_case and bool(hparams.objective == 'mrt')
 
     ## Decoder.
-    with tf.variable_scope("decoder") as decoder_scope:
+    with tf.variable_scope("decoder", reuse=is_second) as decoder_scope:
       cell, decoder_initial_state = self._build_decoder_cell(
           hparams, encoder_outputs, encoder_state,
-          iterator.source_sequence_length)
-
-      ## Train or eval
+          iterator.source_sequence_length, is_second=is_second)
+    
       if self.mode != tf.contrib.learn.ModeKeys.INFER:
         # decoder_emp_inp: [max_time, batch_size, num_units]
         target_input = iterator.target_input
+        target_id = target_input
         if self.time_major:
           target_input = tf.transpose(target_input)
+      else:
+        target_id = None
+           
+      if mle_case or self.mode == tf.contrib.learn.ModeKeys.EVAL or is_second:
         decoder_emb_inp = tf.nn.embedding_lookup(
             self.embedding_decoder, target_input)
-
         # Helper
         helper = tf.contrib.seq2seq.TrainingHelper(
             decoder_emb_inp, iterator.target_sequence_length,
@@ -339,26 +368,18 @@ class BaseModel(object):
             scope=decoder_scope)
 
         sample_id = outputs.sample_id
-
-        # Note: there's a subtle difference here between train and inference.
-        # We could have set output_layer when create my_decoder
-        #   and shared more code between train and inference.
-        # We chose to apply the output_layer to all timesteps for speed:
-        #   10% improvements for small models & 20% for larger ones.
-        # If memory is a concern, we should apply output_layer per timestep.
         device_id = num_layers if num_layers < num_gpus else (num_layers - 1)
         with tf.device(model_helper.get_device_str(device_id, num_gpus)):
           logits = self.output_layer(outputs.rnn_output)
 
-      ## Inference
-      else:
+      elif (mrt_case and not is_second) or self.mode == tf.contrib.learn.ModeKeys.INFER:            
         beam_width = hparams.beam_width
         length_penalty_weight = hparams.length_penalty_weight
         start_tokens = tf.fill([self.batch_size], tgt_sos_id)
         end_token = tgt_eos_id
 
         if beam_width > 0:
-          my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
+          my_decoder = patched_beam_search_decoder.BeamSearchDecoder(
               cell=cell,
               embedding=self.embedding_decoder,
               start_tokens=start_tokens,
@@ -387,24 +408,46 @@ class BaseModel(object):
             output_time_major=self.time_major,
             swap_memory=True,
             scope=decoder_scope)
-
-        if beam_width > 0:
-          logits = tf.no_op()
-          sample_id = outputs.predicted_ids
+        
+        if beam_width > 1:
+            logits = final_context_state.log_probs
+            sample_id = outputs.predicted_ids
         else:
-          logits = outputs.rnn_output
-          sample_id = outputs.sample_id
+            logits = outputs.rnn_output
+            sample_id = outputs.sample_id
+        """
+       
+        # mrt
+        else:
+          if beam_width > 1:
+            logits = tf.concat(
+                [tf.expand_dims(nmt_utils.get_logprobs(logits, target_id), -1), 
+                 final_context_state.log_probs],
+                axis=1)
+            sample_id = outputs.predicted_ids
+          else:
+            logit = outputs.rnn_output
+            sample_id = outputs.sample_id
+        """
+                
+      else: 
+        raise ValueError("Unknown objective type %s" % hparams.objective)   
 
-    return logits, sample_id, final_context_state
+    return logits, target_id, sample_id, final_context_state
 
   def get_max_time(self, tensor):
     time_axis = 0 if self.time_major else 1
     return tensor.shape[time_axis].value or tf.shape(tensor)[time_axis]
 
   @abc.abstractmethod
-  def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
-    """Subclass must implement this.
+  def _build_decoder_cell(self, 
+                          hparams, 
+                          encoder_outputs, 
+                          encoder_state,
+                          source_sequence_length,
+                          is_second=False):
+    """
+    Subclass must implement this.
 
     Args:
       hparams: Hyperparameters configurations.
@@ -418,8 +461,10 @@ class BaseModel(object):
     """
     pass
 
-  def _compute_loss(self, logits):
-    """Compute optimization loss."""
+  def _compute_crossent_loss(self, logits):
+    """
+    Compute optimization loss.
+    """
     target_output = self.iterator.target_output
     if self.time_major:
       target_output = tf.transpose(target_output)
@@ -434,6 +479,61 @@ class BaseModel(object):
     loss = tf.reduce_sum(
         crossent * target_weights) / tf.to_float(self.batch_size)
     return loss
+
+  def _compute_metric_loss(self, ref_logits, logits, 
+                           target_id, sample_id, hparams):
+    """
+    Compute optimization metric loss.
+    """
+    batch_size = hparams.batch_size
+    beam_width = hparams.beam_width if hparams.beam_width > 0 else 1
+    static_batch_size = batch_size * beam_width
+    
+    logits = tf.concat(
+        [tf.expand_dims(
+            nmt_utils.get_logprobs(ref_logits, target_id), -1), 
+        logits], axis=1)
+     
+    target_words = self.reverse_target_vocab_table.lookup(
+        tf.to_int64(target_id))       
+      
+    if beam_width > 0:
+      log_probs = tf.squeeze(tf.nn.softmax(logits, dim=-1))
+      log_probs.set_shape(
+          tensor_shape.TensorShape([static_batch_size + 1]))
+      target_words = tf.contrib.seq2seq.tile_batch(
+          target_words, multiplier=beam_width)    
+      sample_words = self.reverse_target_vocab_table.lookup(          
+              tf.to_int64(tf.transpose(sample_id, perm=[1,2,0])))
+      #sample_words = tf.squeeze(sample_words)
+      sample_words = tf.concat(tf.unstack(sample_words, axis=1), axis=0)
+    else:
+      log_probs = tf.reduce_max(tf.transpose(
+          tf.nn.log_softmax(logits, dim=-1), perm=[1,2,0]), axis=1)
+      log_probs = tf.to_float(tf.negative(tf.reduce_sum(log_probs, axis=1)))
+      log_probs = tf.squeeze(tf.nn.softmax(logits, dim=-1))
+      log_probs.set_shape(
+          tensor_shape.TensorShape([static_batch_size]))      
+      sample_words = self.reverse_target_vocab_table.lookup(
+          tf.to_int64(tf.transpose(sample_id)))
+                   
+    log_probs = hparams.mrt_alpha * log_probs
+       
+    mrt_samples_meanloss = hparams.mrt_samples_meanloss
+    cost_size = static_batch_size + 1
+    cost = tf.py_func(
+          func=bleu._py_func,
+          inp=(sample_words, target_words, mrt_samples_meanloss),
+          Tout=[tf.float32]*cost_size)
+    
+    cost = tf.stop_gradient(tf.stack(cost, axis=0))
+    cost.set_shape(
+          tensor_shape.TensorShape([static_batch_size + 1]))
+    
+    loss = tf.tensordot(log_probs, cost, axes=1)
+    
+    return loss
+    
 
   def _get_infer_summary(self, hparams):
     return tf.no_op()
@@ -567,8 +667,12 @@ class Model(BaseModel):
 
     return tf.concat(bi_outputs, -1), bi_state
 
-  def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
+  def _build_decoder_cell(self, 
+                          hparams,
+                          encoder_outputs, 
+                          encoder_state,
+                          source_sequence_length, 
+                          is_second=False):
     """Build an RNN cell that can be used by decoder."""
     # We only make use of encoder_outputs in attention-based models
     if hparams.attention:
@@ -589,9 +693,15 @@ class Model(BaseModel):
         single_cell_fn=self.single_cell_fn)
 
     # For beam search, we need to replicate encoder infos beam_width times
-    if self.mode == tf.contrib.learn.ModeKeys.INFER and hparams.beam_width > 0:
-      decoder_initial_state = tf.contrib.seq2seq.tile_batch(
-          encoder_state, multiplier=hparams.beam_width)
+    train_case = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
+    mrt_case = train_case and bool(hparams.objective == 'mrt')
+    infer_case = self.mode == tf.contrib.learn.ModeKeys.INFER
+    if (mrt or infer_case) and hparams.beam_width > 0:
+      if is_second is False:
+        decoder_initial_state = tf.contrib.seq2seq.tile_batch(
+            encoder_state, multiplier=hparams.beam_width)
+      else:
+        decoder_initial_state = encoder_state
     else:
       decoder_initial_state = encoder_state
 

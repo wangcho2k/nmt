@@ -22,6 +22,7 @@ import random
 import time
 
 import tensorflow as tf
+from tensorflow.python.ops import lookup_ops
 
 from . import attention_model
 from . import gnmt_model
@@ -47,9 +48,7 @@ class TrainModel(
   pass
 
 
-def create_train_model(
-    model_creator, hparams, scope=None, single_cell_fn=None,
-    model_device_fn=None):
+def create_train_model(model_creator, hparams, scope=None, single_cell_fn=None):
   """Create train graph, model, and iterator."""
   src_file = "%s.%s" % (hparams.train_prefix, hparams.src)
   tgt_file = "%s.%s" % (hparams.train_prefix, hparams.tgt)
@@ -65,7 +64,12 @@ def create_train_model(
     src_dataset = tf.contrib.data.TextLineDataset(src_file)
     tgt_dataset = tf.contrib.data.TextLineDataset(tgt_file)
     skip_count_placeholder = tf.placeholder(shape=(), dtype=tf.int64)
-
+    reverse_tgt_vocab_table = lookup_ops.index_to_string_table_from_file(
+        tgt_vocab_file, default_value=vocab_utils.UNK)
+    
+    if hparams.objective != "mle":
+        hparams.batch_size = 1
+        
     iterator = iterator_utils.get_iterator(
         src_dataset,
         tgt_dataset,
@@ -80,18 +84,15 @@ def create_train_model(
         src_max_len=hparams.src_max_len,
         tgt_max_len=hparams.tgt_max_len,
         skip_count=skip_count_placeholder)
-
-    # Note: One can set model_device_fn to
-    # `tf.train.replica_device_setter(ps_tasks)` for distributed training.
-    with tf.device(model_device_fn):
-      model = model_creator(
-          hparams,
-          iterator=iterator,
-          mode=tf.contrib.learn.ModeKeys.TRAIN,
-          source_vocab_table=src_vocab_table,
-          target_vocab_table=tgt_vocab_table,
-          scope=scope,
-          single_cell_fn=single_cell_fn)
+    model = model_creator(
+        hparams,
+        iterator=iterator,
+        mode=tf.contrib.learn.ModeKeys.TRAIN,
+        source_vocab_table=src_vocab_table,
+        target_vocab_table=tgt_vocab_table,
+        reverse_target_vocab_table=reverse_tgt_vocab_table,
+        scope=scope,
+        single_cell_fn=single_cell_fn)
 
   return TrainModel(
       graph=graph,
@@ -154,7 +155,7 @@ def run_sample_decode(infer_model, infer_sess, model_dir, hparams,
   """Sample decode a random sentence from src_data."""
   with infer_model.graph.as_default():
     loaded_infer_model, global_step = model_helper.create_or_load_model(
-        infer_model.model, model_dir, infer_sess, "infer")
+        infer_model.model, model_dir, infer_sess, hparams, "infer")
 
   _sample_decode(loaded_infer_model, global_step, infer_sess, hparams,
                  infer_model.iterator, src_data, tgt_data,
@@ -167,7 +168,7 @@ def run_internal_eval(
   """Compute internal evaluation (perplexity) for both dev / test."""
   with eval_model.graph.as_default():
     loaded_eval_model, global_step = model_helper.create_or_load_model(
-        eval_model.model, model_dir, eval_sess, "eval")
+        eval_model.model, model_dir, eval_sess, hparams, "eval")
 
   dev_src_file = "%s.%s" % (hparams.dev_prefix, hparams.src)
   dev_tgt_file = "%s.%s" % (hparams.dev_prefix, hparams.tgt)
@@ -199,7 +200,7 @@ def run_external_eval(infer_model, infer_sess, model_dir, hparams,
   """Compute external evaluation (bleu, rouge, etc.) for both dev / test."""
   with infer_model.graph.as_default():
     loaded_infer_model, global_step = model_helper.create_or_load_model(
-        infer_model.model, model_dir, infer_sess, "infer")
+        infer_model.model, model_dir, infer_sess, hparams, "infer")
 
   dev_src_file = "%s.%s" % (hparams.dev_prefix, hparams.src)
   dev_tgt_file = "%s.%s" % (hparams.dev_prefix, hparams.tgt)
@@ -315,18 +316,19 @@ def train(hparams, scope=None, target_session="", single_cell_fn=None):
 
   with train_model.graph.as_default():
     loaded_train_model, global_step = model_helper.create_or_load_model(
-        train_model.model, model_dir, train_sess, "train")
+        train_model.model, model_dir, train_sess, hparams, "train")
 
   # Summary writer
   summary_writer = tf.summary.FileWriter(
       os.path.join(out_dir, summary_name), train_model.graph)
-
+  """
   # First evaluation
   run_full_eval(
       model_dir, infer_model, infer_sess,
       eval_model, eval_sess, hparams,
       summary_writer, sample_src_data,
       sample_tgt_data)
+  """
 
   last_stats_step = global_step
   last_eval_step = global_step
@@ -385,7 +387,8 @@ def train(hparams, scope=None, target_session="", single_cell_fn=None):
     checkpoint_loss += (step_loss * batch_size)
     checkpoint_predict_count += step_predict_count
     checkpoint_total_count += float(step_word_count)
-
+     
+  
     # Once in a while, we print statistics.
     if global_step - last_stats_step >= steps_per_stats:
       last_stats_step = global_step
@@ -407,7 +410,7 @@ def train(hparams, scope=None, target_session="", single_cell_fn=None):
       # Reset timer and loss.
       step_time, checkpoint_loss, checkpoint_predict_count = 0.0, 0.0, 0.0
       checkpoint_total_count = 0.0
-
+      
     if global_step - last_eval_step >= steps_per_eval:
       last_eval_step = global_step
 
@@ -441,7 +444,7 @@ def train(hparams, scope=None, target_session="", single_cell_fn=None):
       dev_scores, test_scores, _ = run_external_eval(
           infer_model, infer_sess, model_dir,
           hparams, summary_writer)
-
+      
   # Done training
   loaded_train_model.saver.save(
       train_sess,

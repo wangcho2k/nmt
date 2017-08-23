@@ -33,8 +33,6 @@ from .utils import vocab_utils
 
 utils.check_tensorflow_version()
 
-FLAGS = None
-
 
 def add_arguments(parser):
   """Build ArgumentParser."""
@@ -55,8 +53,11 @@ def add_arguments(parser):
   parser.add_argument("--time_major", type="bool", nargs="?", const=True,
                       default=True,
                       help="Whether to use time-major mode for dynamic RNN.")
-  parser.add_argument("--num_embeddings_partitions", type=int, default=0,
-                      help="Number of partitions for embedding vars.")
+  parser.add_argument("--objective", type=str, default="mle", 
+                      help="""mle | mrt.""")
+  parser.add_argument("--mrt_alpha", type=float, default="0.005", 
+                      help="""-""")
+  parser.add_argument("--mrt_samples_meanloss", type=int, default="10", help="""-""")
 
   # attention mechanisms
   parser.add_argument("--attention", type=str, default="", help="""\
@@ -100,13 +101,6 @@ def add_arguments(parser):
                       default=True,
                       help=("Whether try colocating gradients with "
                             "corresponding op"))
-
-  # initializer
-  parser.add_argument("--init_op", type=str, default="uniform",
-                      help="uniform | glorot_normal | glorot_uniform")
-  parser.add_argument("--init_weight", type=float, default=0.1,
-                      help=("for uniform init_op, initialize weights "
-                           "between [-this, this]."))
 
   # data
   parser.add_argument("--src", type=str, default=None,
@@ -160,6 +154,8 @@ def add_arguments(parser):
                       help="Dropout rate (not keep_prob)")
   parser.add_argument("--max_gradient_norm", type=float, default=5.0,
                       help="Clip gradients to this norm.")
+  parser.add_argument("--init_weight", type=float, default=0.1,
+                      help="Initial weights from [-this, this].")
   parser.add_argument("--source_reverse", type="bool", nargs="?", const=True,
                       default=False, help="Reverse source sequence.")
   parser.add_argument("--batch_size", type=int, default=128, help="Batch size.")
@@ -248,7 +244,9 @@ def create_hparams(flags):
       encoder_type=flags.encoder_type,
       residual=flags.residual,
       time_major=flags.time_major,
-      num_embeddings_partitions=flags.num_embeddings_partitions,
+      objective=FLAGS.objective,
+      mrt_alpha=FLAGS.mrt_alpha,
+      mrt_samples_meanloss=FLAGS.mrt_samples_meanloss,
 
       # Attention mechanisms
       attention=flags.attention,
@@ -259,7 +257,6 @@ def create_hparams(flags):
       optimizer=flags.optimizer,
       num_train_steps=flags.num_train_steps,
       batch_size=flags.batch_size,
-      init_op=flags.init_op,
       init_weight=flags.init_weight,
       max_gradient_norm=flags.max_gradient_norm,
       learning_rate=flags.learning_rate,
@@ -303,9 +300,11 @@ def create_hparams(flags):
 def extend_hparams(hparams):
   """Extend training hparams."""
   # Sanity checks
+  """
   if hparams.encoder_type == "bi" and hparams.num_layers % 2 != 0:
     raise ValueError("For bi, num_layers %d should be even" %
                      hparams.num_layers)
+  """
   if (hparams.attention_architecture in ["gnmt"] and
       hparams.num_layers < 2):
     raise ValueError("For gnmt attention architecture, "
@@ -402,8 +401,7 @@ def ensure_compatible_hparams(hparams, default_hparams, hparams_path):
   for key in updated_keys:
     if key in default_config and getattr(hparams, key) != default_config[key]:
       utils.print_out("# Updating hparams.%s: %s -> %s" %
-                      (key, str(getattr(hparams, key)),
-                       str(default_config[key])))
+                      (key, str(getattr(hparams, key)), str(default_config[key])))
       setattr(hparams, key, default_config[key])
   return hparams
 
@@ -418,7 +416,7 @@ def create_or_load_hparams(out_dir, default_hparams, hparams_path):
     hparams = extend_hparams(hparams)
   else:
     hparams = ensure_compatible_hparams(hparams, default_hparams, hparams_path)
-
+    
   # Save HParams
   utils.save_hparams(out_dir, hparams)
 
@@ -430,7 +428,7 @@ def create_or_load_hparams(out_dir, default_hparams, hparams_path):
   return hparams
 
 
-def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
+def run_main(flags, default_hparams, train_fn, inference_fn):
   """Run main."""
   # Job
   jobid = flags.jobid
@@ -478,7 +476,7 @@ def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
         utils.print_out("  %s: %.1f" % (metric, score))
   else:
     # Train
-    train_fn(hparams, target_session=target_session)
+    train_fn(hparams)
 
 
 def main(unused_argv):
