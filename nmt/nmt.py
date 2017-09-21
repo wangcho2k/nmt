@@ -82,6 +82,9 @@ def add_arguments(parser):
       Whether to pass encoder's hidden state to decoder when using an attention
       based model.\
       """)
+  parser.add_argument("--ngram_attention", type=int, default=0, help="""\
+      N value for n-gram attention. To use n-gram attention, use a value larger than 0.\
+      """)
 
   # optimizer
   parser.add_argument("--optimizer", type=str, default="sgd", help="sgd | adam")
@@ -261,6 +264,7 @@ def create_hparams(flags):
       attention=flags.attention,
       attention_architecture=flags.attention_architecture,
       pass_hidden_state=flags.pass_hidden_state,
+      ngram_attention=flags.ngram_attention,
 
       # Train
       optimizer=flags.optimizer,

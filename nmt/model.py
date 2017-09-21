@@ -255,11 +255,11 @@ class BaseModel(object):
 
     with tf.variable_scope(scope or "dynamic_seq2seq", dtype=dtype):
       # Encoder
-      encoder_outputs, encoder_state = self._build_encoder(hparams)
+      encoder_outputs, encoder_state, embedded_input = self._build_encoder(hparams)
 
       ## Decoder
       logits, target_id, sample_id, final_context_state = self._build_decoder(
-          encoder_outputs, encoder_state, hparams)
+          encoder_outputs, encoder_state, hparams, emb_input=embedded_input)
       ### Secondary decoder for the MRT and PDL objectives
       ### only needs the predicted sample_id
       sec_sample_id = None
@@ -310,7 +310,8 @@ class BaseModel(object):
         base_gpu=base_gpu,
         single_cell_fn=self.single_cell_fn)
 
-  def _build_decoder(self, encoder_outputs, encoder_state, hparams, secondary=False):
+  def _build_decoder(self, encoder_outputs, encoder_state, hparams,
+                     secondary=False, emb_input=None):
     """Build and run a RNN decoder with a final projection layer.
 
     Args:
@@ -354,7 +355,7 @@ class BaseModel(object):
     with tf.variable_scope("decoder", reuse=reuse) as decoder_scope:
       cell, decoder_initial_state = self._build_decoder_cell(
           hparams, encoder_outputs, encoder_state,
-          iterator.source_sequence_length, secondary=secondary)
+          iterator.source_sequence_length, secondary=secondary, emb_input=emb_input)
       target_id = None
 
       ## Train or eval
@@ -450,7 +451,7 @@ class BaseModel(object):
 
   @abc.abstractmethod
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length, secondary=False):
+                          source_sequence_length, secondary=False, emb_input=None):
     """Subclass must implement this.
 
     Args:
@@ -633,6 +634,10 @@ class Model(BaseModel):
       # Look up embedding, emp_inp: [max_time, batch_size, num_units]
       encoder_emb_inp = tf.nn.embedding_lookup(
           self.embedding_encoder, source)
+      if hparams.ngram_attention > 0:
+        embedded_input = encoder_emb_inp
+      else:
+        embedded_input = None
 
       # Encoder_outpus: [max_time, batch_size, num_units]
       if hparams.encoder_type == "uni":
@@ -673,7 +678,7 @@ class Model(BaseModel):
           encoder_state = tuple(encoder_state)
       else:
         raise ValueError("Unknown encoder_type %s" % hparams.encoder_type)
-    return encoder_outputs, encoder_state
+    return encoder_outputs, encoder_state, embedded_input
 
   def _build_bidirectional_rnn(self, inputs, sequence_length,
                                dtype, hparams,
@@ -716,7 +721,7 @@ class Model(BaseModel):
     return tf.concat(bi_outputs, -1), bi_state
 
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length, secondary=False):
+                          source_sequence_length, secondary=False, emb_input=None):
     """Build an RNN cell that can be used by decoder."""
     # We only make use of encoder_outputs in attention-based models
     if hparams.attention:

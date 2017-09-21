@@ -57,7 +57,7 @@ class AttentionModel(model.Model):
       self.infer_summary = self._get_infer_summary(hparams)
 
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length, secondary=False):
+                          source_sequence_length, secondary=False, emb_input=None):
     """Build a RNN cell with attention mechanism that can be used by decoder."""
     attention_option = hparams.attention
     attention_architecture = hparams.attention_architecture
@@ -72,12 +72,27 @@ class AttentionModel(model.Model):
     num_gpus = hparams.num_gpus
     beam_width = hparams.beam_width
 
+    if hparams.ngram_attention > 0 and emb_input is not None:
+        use_ngram = True
+        num_ngram = hparams.ngram_attention
+    else:
+        use_ngram = False
+
     dtype = tf.float32
 
     if self.time_major:
       memory = tf.transpose(encoder_outputs, [1, 0, 2])
     else:
       memory = encoder_outputs
+
+    if use_ngram:
+        # create n-gram feature
+        # emp_inp: [max_time, batch_size, num_units]
+        ngram_projection = tf.get_variable("ngram_projection", [num_units * num_ngram, num_units],
+                                           dtype=dtype)
+        ngram_concatenated = [tf.concat(emb_input[i:i + num_ngram], axis=1) for i in
+                              range(len(emb_input) - (num_ngram - 1))]  # b_q
+        pass
 
     if (self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0) or \
             (hparams.objective != 'mle' and hparams.beam_width > 0 and secondary):
@@ -87,6 +102,9 @@ class AttentionModel(model.Model):
           source_sequence_length, multiplier=beam_width)
       encoder_state = tf.contrib.seq2seq.tile_batch(
           encoder_state, multiplier=beam_width)
+      if use_ngram:
+          emb_input = tf.contrib.seq2seq.tile_batch(
+              emb_input, multiplier=beam_width)
       batch_size = self.batch_size * beam_width
     else:
       batch_size = self.batch_size
