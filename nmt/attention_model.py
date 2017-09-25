@@ -82,17 +82,10 @@ class AttentionModel(model.Model):
 
     if self.time_major:
       memory = tf.transpose(encoder_outputs, [1, 0, 2])
+      if use_ngram:
+          emb_input = tf.transpose(emb_input, [1, 0, 2])
     else:
       memory = encoder_outputs
-
-    if use_ngram:
-        # create n-gram feature
-        # emp_inp: [max_time, batch_size, num_units]
-        ngram_projection = tf.get_variable("ngram_projection", [num_units * num_ngram, num_units],
-                                           dtype=dtype)
-        ngram_concatenated = [tf.concat(emb_input[i:i + num_ngram], axis=1) for i in
-                              range(len(emb_input) - (num_ngram - 1))]  # b_q
-        pass
 
     if (self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0) or \
             (hparams.objective != 'mle' and hparams.beam_width > 0 and secondary):
@@ -109,8 +102,34 @@ class AttentionModel(model.Model):
     else:
       batch_size = self.batch_size
 
-    attention_mechanism = create_attention_mechanism(
-        attention_option, num_units, memory, source_sequence_length)
+    if use_ngram:
+        # create n-gram feature
+        # emp_inp: [batch_size, max_time, num_units]
+        emb_input = tf.expand_dims(emb_input, axis=2)
+        # emb_input should be [batch_size, time, 1, num_units] for conv2d
+        filter = tf.get_variable('fltr_%d' % num_ngram, [num_ngram, 1, num_units, num_units])
+        ngram_feature = tf.nn.conv2d(emb_input, filter, [1, 1, 1, 1], 'SAME')
+        ngram_feature = tf.squeeze(ngram_feature,[2])
+        #ngram_feature = tf.Print(ngram_feature, [ngram_feature])
+        # now ngram_feature should be batch-major : [batch_size, ngram_time, num_units]
+        #pass
+
+    #import pdb; pdb.set_trace()
+
+    if use_ngram:
+        #length of n-gram memory
+        ngram_length = source_sequence_length
+        #ngram_length = source_sequence_length - (num_ngram - 1)
+        #ngram_length = tf.Print(ngram_length, [ngram_length])
+        #import pdb; pdb.set_trace()
+        with tf.name_scope("NgramAttention"):
+            attention_mechanism_ngram = create_attention_mechanism(
+                attention_option, num_units, ngram_feature, ngram_length)
+        attention_mechanism = create_attention_mechanism(
+            attention_option, num_units, memory, source_sequence_length)
+    else:
+        attention_mechanism = create_attention_mechanism(
+            attention_option, num_units, memory, source_sequence_length)
 
     cell = model_helper.create_rnn_cell(
         unit_type=hparams.unit_type,
@@ -126,12 +145,20 @@ class AttentionModel(model.Model):
     # Only generate alignment in greedy INFER mode.
     alignment_history = (self.mode == tf.contrib.learn.ModeKeys.INFER and
                          beam_width == 0)
-    cell = tf.contrib.seq2seq.AttentionWrapper(
-        cell,
-        attention_mechanism,
-        attention_layer_size=num_units,
-        alignment_history=alignment_history,
-        name="attention")
+    if use_ngram:
+        cell = tf.contrib.seq2seq.AttentionWrapper(
+            cell,
+            [attention_mechanism, attention_mechanism_ngram],
+            attention_layer_size=[num_units, num_units],
+            alignment_history=alignment_history,
+            name="attention")
+    else:
+        cell = tf.contrib.seq2seq.AttentionWrapper(
+            cell,
+            attention_mechanism,
+            attention_layer_size=num_units,
+            alignment_history=alignment_history,
+            name="attention")
 
     # TODO(thangluong): do we need num_layers, num_gpus?
     cell = tf.contrib.rnn.DeviceWrapper(cell,
