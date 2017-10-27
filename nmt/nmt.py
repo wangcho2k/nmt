@@ -87,12 +87,27 @@ def add_arguments(parser):
   parser.add_argument("--optimizer", type=str, default="sgd", help="sgd | adam")
   parser.add_argument("--learning_rate", type=float, default=1.0,
                       help="Learning rate. Adam: 0.001 | 0.0001")
+  parser.add_argument("--warmup_steps", type=int, default=0,
+                      help="How many steps we inverse-decay learning.")
+  parser.add_argument("--warmup_scheme", type=str, default="t2t", help="""\
+      How to warmup learning rates. Options include:
+        t2t: Tensor2Tensor's way, start with lr 100 times smaller, then
+             exponentiate until the specified lr.\
+      """)
   parser.add_argument("--start_decay_step", type=int, default=0,
                       help="When we start to decay")
   parser.add_argument("--decay_steps", type=int, default=10000,
                       help="How frequent we decay")
-  parser.add_argument("--decay_factor", type=float, default=0.98,
+  parser.add_argument("--decay_factor", type=float, default=1.0,
                       help="How much we decay.")
+  parser.add_argument(
+      "--learning_rate_decay_scheme", type=str, default="", help="""\
+      If specified, overwrite start_decay_step, decay_steps, decay_factor.
+      Options include:
+        luong: after 1/2 num train steps, we start halving the learning rate
+        for 5 times before finishing.\
+      """)
+
   parser.add_argument(
       "--num_train_steps", type=int, default=12000, help="Num steps to train.")
   parser.add_argument("--colocate_gradients_with_ops", type="bool", nargs="?",
@@ -106,7 +121,7 @@ def add_arguments(parser):
                       help="uniform | glorot_normal | glorot_uniform")
   parser.add_argument("--init_weight", type=float, default=0.1,
                       help=("for uniform init_op, initialize weights "
-                           "between [-this, this]."))
+                            "between [-this, this]."))
 
   # data
   parser.add_argument("--src", type=str, default=None,
@@ -137,6 +152,11 @@ def add_arguments(parser):
       Whether to use the source vocab and embeddings for both source and
       target.\
       """)
+  parser.add_argument("--check_special_token", type="bool", default=True,
+                      help="""\
+                      Whether check special sos, eos, unk tokens exist in the
+                      vocab files.\
+                      """)
 
   # Sequence lengths
   parser.add_argument("--src_max_len", type=int, default=50,
@@ -153,7 +173,7 @@ def add_arguments(parser):
 
   # Default settings works well (rarely need to change)
   parser.add_argument("--unit_type", type=str, default="lstm",
-                      help="lstm | gru | layer_norm_lstm")
+                      help="lstm | gru | layer_norm_lstm | nas")
   parser.add_argument("--forget_bias", type=float, default=1.0,
                       help="Forget bias for BasicLSTMCell.")
   parser.add_argument("--dropout", type=float, default=0.2,
@@ -174,7 +194,15 @@ def add_arguments(parser):
 
   # BPE
   parser.add_argument("--bpe_delimiter", type=str, default=None,
-                      help="Set to @@ to activate BPE")
+                      help="Set to @@ to activate BPE."
+                           "Implicitly sets subword_option to 'bpe' when set.")
+
+  # SPM
+  parser.add_argument("--subword_option", type=str, default=None,
+                      choices=["bpe", "spm"],
+                      help="""\
+                      Set to bpe or spm to activate subword desegmentation.\
+                      """)
 
   # Misc
   parser.add_argument("--num_gpus", type=int, default=1,
@@ -196,6 +224,9 @@ def add_arguments(parser):
                             "hparams values from FLAGS."))
   parser.add_argument("--random_seed", type=int, default=None,
                       help="Random seed (>0, set a specific seed).")
+  parser.add_argument("--override_loaded_hparams", type="bool", nargs="?",
+                      const=True, default=False,
+                      help="Override loaded hparams with values specified")
 
   # Inference
   parser.add_argument("--ckpt", type=str, default="",
@@ -220,6 +251,11 @@ def add_arguments(parser):
       """))
   parser.add_argument("--length_penalty_weight", type=float, default=0.0,
                       help="Length penalty for beam search.")
+  parser.add_argument("--num_translations_per_input", type=int, default=1,
+                      help=("""\
+      Number of translations generated for each sentence. This is only used for
+      inference.\
+      """))
 
   # Job info
   parser.add_argument("--jobid", type=int, default=0,
@@ -263,9 +299,12 @@ def create_hparams(flags):
       init_weight=flags.init_weight,
       max_gradient_norm=flags.max_gradient_norm,
       learning_rate=flags.learning_rate,
+      warmup_steps=flags.warmup_steps,
+      warmup_scheme=flags.warmup_scheme,
       start_decay_step=flags.start_decay_step,
       decay_factor=flags.decay_factor,
       decay_steps=flags.decay_steps,
+      learning_rate_decay_scheme=flags.learning_rate_decay_scheme,
       colocate_gradients_with_ops=flags.colocate_gradients_with_ops,
 
       # Data constraints
@@ -281,11 +320,14 @@ def create_hparams(flags):
       infer_batch_size=flags.infer_batch_size,
       beam_width=flags.beam_width,
       length_penalty_weight=flags.length_penalty_weight,
+      num_translations_per_input=flags.num_translations_per_input,
 
       # Vocab
       sos=flags.sos if flags.sos else vocab_utils.SOS,
       eos=flags.eos if flags.eos else vocab_utils.EOS,
       bpe_delimiter=flags.bpe_delimiter,
+      subword_option=flags.subword_option,
+      check_special_token=flags.check_special_token,
 
       # Misc
       forget_bias=flags.forget_bias,
@@ -297,6 +339,7 @@ def create_hparams(flags):
       metrics=flags.metrics.split(","),
       log_device_placement=flags.log_device_placement,
       random_seed=flags.random_seed,
+      override_loaded_hparams=flags.override_loaded_hparams,
   )
 
 
@@ -310,6 +353,19 @@ def extend_hparams(hparams):
       hparams.num_layers < 2):
     raise ValueError("For gnmt attention architecture, "
                      "num_layers %d should be >= 2" % hparams.num_layers)
+
+  if hparams.subword_option and hparams.subword_option not in ["spm", "bpe"]:
+    raise ValueError("subword option must be either spm, or bpe")
+  if hparams.bpe_delimiter and hparams.bpe_delimiter != "@@":
+    raise ValueError("BPE delimiter value must be '@@' %s",
+                     hparams.bpe_delimiter)
+  if hparams.bpe_delimiter == "@@":
+    # if bpe_delimiter is set, subword_option will automatically set to bpe
+    if hparams.subword_option == "spm":
+      raise ValueError("Unable to set the subword option to spm "
+                       "if bpe delimiter is set")
+    else:
+      hparams.subword_option = "bpe"
 
   # Flags
   utils.print_out("# hparams:")
@@ -345,6 +401,7 @@ def extend_hparams(hparams):
   src_vocab_size, src_vocab_file = vocab_utils.check_vocab(
       src_vocab_file,
       hparams.out_dir,
+      check_special_token=hparams.check_special_token,
       sos=hparams.sos,
       eos=hparams.eos,
       unk=vocab_utils.UNK)
@@ -358,6 +415,7 @@ def extend_hparams(hparams):
     tgt_vocab_size, tgt_vocab_file = vocab_utils.check_vocab(
         tgt_vocab_file,
         hparams.out_dir,
+        check_special_token=hparams.check_special_token,
         sos=hparams.sos,
         eos=hparams.eos,
         unk=vocab_utils.UNK)
@@ -394,21 +452,19 @@ def ensure_compatible_hparams(hparams, default_hparams, hparams_path):
     if key not in config:
       hparams.add_hparam(key, default_config[key])
 
-  # Make sure that the loaded model has latest values for the below keys
-  updated_keys = [
-      "out_dir", "num_gpus", "test_prefix", "beam_width",
-      "length_penalty_weight", "num_train_steps"
-  ]
-  for key in updated_keys:
-    if key in default_config and getattr(hparams, key) != default_config[key]:
-      utils.print_out("# Updating hparams.%s: %s -> %s" %
-                      (key, str(getattr(hparams, key)),
-                       str(default_config[key])))
-      setattr(hparams, key, default_config[key])
+  # Update all hparams' keys if override_loaded_hparams=True
+  if default_hparams.override_loaded_hparams:
+    for key in default_config:
+      if getattr(hparams, key) != default_config[key]:
+        utils.print_out("# Updating hparams.%s: %s -> %s" %
+                        (key, str(getattr(hparams, key)),
+                         str(default_config[key])))
+        setattr(hparams, key, default_config[key])
   return hparams
 
 
-def create_or_load_hparams(out_dir, default_hparams, hparams_path):
+def create_or_load_hparams(
+    out_dir, default_hparams, hparams_path, save_hparams=True):
   """Create hparams or load hparams from out_dir."""
   hparams = utils.load_hparams(out_dir)
   if not hparams:
@@ -420,10 +476,10 @@ def create_or_load_hparams(out_dir, default_hparams, hparams_path):
     hparams = ensure_compatible_hparams(hparams, default_hparams, hparams_path)
 
   # Save HParams
-  utils.save_hparams(out_dir, hparams)
-
-  for metric in hparams.metrics:
-    utils.save_hparams(getattr(hparams, "best_" + metric + "_dir"), hparams)
+  if save_hparams:
+    utils.save_hparams(out_dir, hparams)
+    for metric in hparams.metrics:
+      utils.save_hparams(getattr(hparams, "best_" + metric + "_dir"), hparams)
 
   # Print HParams
   utils.print_hparams(hparams)
@@ -449,7 +505,8 @@ def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
   if not tf.gfile.Exists(out_dir): tf.gfile.MakeDirs(out_dir)
 
   # Load hparams.
-  hparams = create_or_load_hparams(out_dir, default_hparams, flags.hparams_path)
+  hparams = create_or_load_hparams(
+      out_dir, default_hparams, flags.hparams_path, save_hparams=(jobid==0))
 
   if flags.inference_input_file:
     # Inference indices
@@ -474,7 +531,7 @@ def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
             ref_file,
             trans_file,
             metric,
-            hparams.bpe_delimiter)
+            hparams.subword_option)
         utils.print_out("  %s: %.1f" % (metric, score))
   else:
     # Train
