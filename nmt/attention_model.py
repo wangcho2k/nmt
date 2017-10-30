@@ -22,6 +22,8 @@ import tensorflow as tf
 from . import model
 from . import model_helper
 
+from . import reordering_attention
+
 __all__ = ["AttentionModel"]
 
 
@@ -107,9 +109,12 @@ class AttentionModel(model.Model):
     # Only generate alignment in greedy INFER mode.
     alignment_history = (self.mode == tf.contrib.learn.ModeKeys.INFER and
                          beam_width == 0)
-    cell = tf.contrib.seq2seq.AttentionWrapper(
+    #cell = tf.contrib.seq2seq.AttentionWrapper(
+    cell = reordering_attention.ReorderingAttentionWrapper(
         cell,
         attention_mechanism,
+        "source",
+        3,
         attention_layer_size=num_units,
         alignment_history=alignment_history,
         name="attention")
