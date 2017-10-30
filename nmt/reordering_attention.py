@@ -32,13 +32,17 @@ from tensorflow.python.layers import core as layers_core
 from tensorflow.contrib.seq2seq.python.ops import attention_wrapper
 
 def _compute_attention_with_distortion(attention_mechanism, cell_output,
-                                       previous_alignments, attention_layer):
+                                       previous_alignments, attention_layer,
+                                       distorted_alignments):
     """
     Computes the attention and alignments for a given attention_mechanism
     with distortion model.
     """
     alignments = attention_mechanism(
       cell_output, previous_alignments=previous_alignments)
+    with tf.control_dependencies([
+        tf.assert_equal(tf.shape(alignments),tf.shape(distorted_alignments[-1,:,:]))]):
+        alignments = 0.5*alignments + 0.5*distorted_alignments[-1,:,:]
 
     # Reshape from [batch_size, memory_time] to [batch_size, 1, memory_time]
     expanded_alignments = array_ops.expand_dims(alignments, 1)
@@ -174,25 +178,25 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         all_attentions = []
         all_histories = []
         for i, attention_mechanism in enumerate(self._attention_mechanisms):
-            attention, alignments = attention_wrapper._compute_attention(
-                attention_mechanism, cell_output, previous_alignments[i],
-                self._attention_layers[i] if self._attention_layers else None)
-            alignment_history = previous_alignment_history[i].write(
-                state.time, alignments) if self._alignment_history else ()
-
             if self.dmodel[1] == "source":
                 distortion_output = self.dmodel[0](state.attention)
             elif self.dmodel[1] == "hidden":
-                distortion_output = self.dmodel[0](state.cell_state)
-            distortion_output = tf.nn.softmax(distortion_output)
+                distortion_output = self.dmodel[0](state.cell_state[-1].h)
+            distortion_output = tf.transpose(tf.nn.softmax(distortion_output)) # should be [7, batch]
 
             distorted_alignments = tf.scan(lambda a,t :
-                                           a+t[1]*tf.matmul(previous_alignments[i],t[0]),
+                                           a+tf.transpose(t[1]*tf.transpose(tf.matmul(previous_alignments[i],t[0]))),
                                            (self.shifting_matrices, distortion_output),
                                            initializer=tf.zeros_like(previous_alignments[i]))
 
-            alignments = 0.5*alignments + 0.5*distorted_alignments[-1,:,:]
-            #distorted_alignments = tf.Print(distorted_alignments,[distorted_alignments],summarize=20)
+            attention, alignments = _compute_attention_with_distortion(
+                attention_mechanism, cell_output, previous_alignments[i],
+                self._attention_layers[i] if self._attention_layers else None,
+                distorted_alignments)
+            alignment_history = previous_alignment_history[i].write(
+                state.time, alignments) if self._alignment_history else ()
+
+            #distorted_alignments = tf.Print(distorted_alignments,[distorted_alignments],summarize=40)
 
             all_alignments.append(alignments)
             all_histories.append(alignment_history)

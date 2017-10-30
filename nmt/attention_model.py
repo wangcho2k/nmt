@@ -113,7 +113,7 @@ class AttentionModel(model.Model):
     cell = reordering_attention.ReorderingAttentionWrapper(
         cell,
         attention_mechanism,
-        "source",
+        "hidden",
         3,
         attention_layer_size=num_units,
         alignment_history=alignment_history,
