@@ -16,7 +16,7 @@
 """
 A patched attention mechanisms for implementation of the distortion model on attention mechanism.
 
-Reference : 
+Reference :
 Incorporating Word Reordering Knowledge into Attention-based Neural Machine Translation
 J. Zhang et al., ACL 2017
 """
@@ -109,12 +109,16 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         max_time = self._attention_mechanisms[0].alignments_size
         for i in range(-1*jump_distance,0): # -k to -1
             tmp = tf.eye(max_time)
-            tmp = tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0)
+            tmp = tf.cond(abs(i) >= max_time,
+                    lambda: tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0),
+                    lambda: 0 * tmp)
             shifting_matrices.append(tmp)
         shifting_matrices.append(tf.eye(max_time)) # k = 0
         for i in range(1,jump_distance+1): # 1 to k
             tmp = tf.eye(max_time)
-            tmp = tf.concat([tmp[i:,:],tf.zeros([i,max_time])],0)
+            tmp = tf.cond(i >= max_time,
+                    lambda: tf.concat([tmp[i:,:],tf.zeros([i,max_time])],0),
+                    lambda: 0 * tmp)
             shifting_matrices.append(tmp)
         self.shifting_matrices = tf.stack(shifting_matrices)
 
