@@ -110,15 +110,15 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         for i in range(-1*jump_distance,0): # -k to -1
             tmp = tf.eye(max_time)
             tmp = tf.cond(abs(i) >= max_time,
-                    lambda: tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0),
-                    lambda: 0 * tmp)
+                          lambda: 0 * tmp,
+                          lambda: tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0),)
             shifting_matrices.append(tmp)
         shifting_matrices.append(tf.eye(max_time)) # k = 0
         for i in range(1,jump_distance+1): # 1 to k
             tmp = tf.eye(max_time)
             tmp = tf.cond(i >= max_time,
-                    lambda: tf.concat([tmp[i:,:],tf.zeros([i,max_time])],0),
-                    lambda: 0 * tmp)
+                          lambda: 0 * tmp,
+                          lambda: tf.concat([tmp[i:, :], tf.zeros([i, max_time])], 0))
             shifting_matrices.append(tmp)
         self.shifting_matrices = tf.stack(shifting_matrices)
 
