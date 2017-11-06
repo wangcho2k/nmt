@@ -36,7 +36,7 @@ def _compute_attention_with_distortion(attention_mechanism, cell_output,
                                        distorted_alignments):
     """
     Computes the attention and alignments for a given attention_mechanism
-    with distortion model.
+    with distorted alignments.
     """
     alignments = attention_mechanism(
       cell_output, previous_alignments=previous_alignments)
@@ -63,7 +63,7 @@ def _compute_attention_with_distortion(attention_mechanism, cell_output,
     else:
         attention = context
 
-    return attention, alignments
+    return attention, alignments, context
 
 class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
     """
@@ -111,7 +111,7 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
             tmp = tf.eye(max_time)
             tmp = tf.cond(abs(i) >= max_time,
                           lambda: 0 * tmp,
-                          lambda: tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0),)
+                          lambda: tf.concat([tf.zeros([-1*i,max_time]),tmp[0:i,:]],0))
             shifting_matrices.append(tmp)
         shifting_matrices.append(tf.eye(max_time)) # k = 0
         for i in range(1,jump_distance+1): # 1 to k
@@ -181,6 +181,7 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         all_alignments = []
         all_attentions = []
         all_histories = []
+        all_contexts = []
         for i, attention_mechanism in enumerate(self._attention_mechanisms):
             if self.dmodel[1] == "source":
                 distortion_output = self.dmodel[0](state.attention)
@@ -193,7 +194,7 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
                                            (self.shifting_matrices, distortion_output),
                                            initializer=tf.zeros_like(previous_alignments[i]))
 
-            attention, alignments = _compute_attention_with_distortion(
+            attention, alignments, context = _compute_attention_with_distortion(
                 attention_mechanism, cell_output, previous_alignments[i],
                 self._attention_layers[i] if self._attention_layers else None,
                 distorted_alignments)
@@ -205,8 +206,10 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
             all_alignments.append(alignments)
             all_histories.append(alignment_history)
             all_attentions.append(attention)
+            all_contexts.append(context)
 
         attention = array_ops.concat(all_attentions, 1)
+        context = array_ops.concat(all_contexts, 1)
         next_state = attention_wrapper.AttentionWrapperState(
             time=state.time + 1,
             cell_state=next_cell_state,

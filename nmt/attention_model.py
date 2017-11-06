@@ -109,15 +109,25 @@ class AttentionModel(model.Model):
     # Only generate alignment in greedy INFER mode.
     alignment_history = (self.mode == tf.contrib.learn.ModeKeys.INFER and
                          beam_width == 0)
-    #cell = tf.contrib.seq2seq.AttentionWrapper(
-    cell = reordering_attention.ReorderingAttentionWrapper(
-        cell,
-        attention_mechanism,
-        "hidden",
-        3,
-        attention_layer_size=num_units,
-        alignment_history=alignment_history,
-        name="attention")
+
+    # Create an attention mechanism with distortion model
+    # if the option is given
+    if hparams.distortion_model == "source" or hparams.distortion_model == "hidden" :
+        cell = reordering_attention.ReorderingAttentionWrapper(
+            cell,
+            attention_mechanism,
+            hparams.distortion_model,
+            hparams.distortion_distance,
+            attention_layer_size=num_units,
+            alignment_history=alignment_history,
+            name="attention_with_distortion")
+    else:
+        cell = tf.contrib.seq2seq.AttentionWrapper(
+            cell,
+            attention_mechanism,
+            attention_layer_size=num_units,
+            alignment_history=alignment_history,
+            name="attention")
 
     # TODO(thangluong): do we need num_layers, num_gpus?
     cell = tf.contrib.rnn.DeviceWrapper(cell,

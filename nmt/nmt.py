@@ -82,6 +82,14 @@ def add_arguments(parser):
       Whether to pass encoder's hidden state to decoder when using an attention
       based model.\
       """)
+  parser.add_argument("--distortion_model",
+                      type=str,
+                      default="",
+                      help="""\
+                      source | hidden or set to "" for no distortion model on attention mechanism.\ 
+                      """)
+  parser.add_argument("--distortion_distance",
+                      type=int, default=3, help="Jump distance for distortion model.")
 
   # optimizer
   parser.add_argument("--optimizer", type=str, default="sgd", help="sgd | adam")
@@ -254,6 +262,8 @@ def create_hparams(flags):
       attention=flags.attention,
       attention_architecture=flags.attention_architecture,
       pass_hidden_state=flags.pass_hidden_state,
+      distortion_model=flags.distortion_model,
+      distortion_distance=flags.distortion_distance,
 
       # Train
       optimizer=flags.optimizer,
