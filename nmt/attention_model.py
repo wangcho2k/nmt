@@ -112,7 +112,7 @@ class AttentionModel(model.Model):
 
     # Create an attention mechanism with distortion model
     # if the option is given
-    if hparams.distortion_model == "source" or hparams.distortion_model == "hidden" :
+    if hparams.distortion_model != "":
         cell = reordering_attention.ReorderingAttentionWrapper(
             cell,
             attention_mechanism,

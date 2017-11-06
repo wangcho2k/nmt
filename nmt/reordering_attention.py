@@ -25,11 +25,20 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+import collections
+
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.framework import dtypes
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import rnn_cell_impl
+from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.layers import core as layers_core
 from tensorflow.contrib.seq2seq.python.ops import attention_wrapper
+from tensorflow.python.util import nest
+
+_zero_state_tensors = rnn_cell_impl._zero_state_tensors  # pylint: disable=protected-access
 
 def _compute_attention_with_distortion(attention_mechanism, cell_output,
                                        previous_alignments, attention_layer,
@@ -65,6 +74,41 @@ def _compute_attention_with_distortion(attention_mechanism, cell_output,
 
     return attention, alignments, context
 
+class PatchedAttentionWrapperState(
+    collections.namedtuple("PatchedAttentionWrapperState",
+                           ("cell_state", "attention", "time", "alignments",
+                            "alignment_history", "contexts"))):
+  """A patched `AttentionWrapperState` to include the context vector.
+  Contains:
+    - `cell_state`: The state of the wrapped `RNNCell` at the previous time
+      step.
+    - `attention`: The attention emitted at the previous time step.
+    - `time`: int32 scalar containing the current time step.
+    - `alignments`: A single or tuple of `Tensor`(s) containing the alignments
+       emitted at the previous time step for each attention mechanism.
+    - `alignment_history`: (if enabled) a single or tuple of `TensorArray`(s)
+       containing alignment matrices from all time steps for each attention
+       mechanism. Call `stack()` on each to convert to a `Tensor`.
+    - `context` : A single or tuple of `Tensor`(s) containing the context vector 
+       emitted at the previous time step.
+  """
+
+  def clone(self, **kwargs):
+    """Clone this object, overriding components provided by kwargs.
+    Example:
+    ```python
+    initial_state = attention_wrapper.zero_state(dtype=..., batch_size=...)
+    initial_state = initial_state.clone(cell_state=encoder_state)
+    ```
+    Args:
+      **kwargs: Any properties of the state object to replace in the returned
+        `PatchedAttentionWrapperState`.
+    Returns:
+      A new `PatchedAttentionWrapperState` whose properties are the same as
+      this one, except any overridden properties as provided in `kwargs`.
+    """
+    return super(PatchedAttentionWrapperState, self)._replace(**kwargs)
+
 class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
     """
     Patched AttentionWrapper for distortion model
@@ -93,13 +137,8 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         self.jump_distance = jump_distance
 
         # creating distortion model
-        if distortion_model == "source":
-            # S-distortion model, using previous attention as input
-            pass
-        elif distortion_model == "hidden":
-            # H-distortion model, using previous cell state as input
-            pass
-        else:
+        if distortion_model != "source" and distortion_model != "hidden" and \
+                        distortion_model != "target" and distortion_model != "context":
             raise ValueError("Unknown distortion model %s" % distortion_model)
         self.dmodel = (layers_core.Dense(units=2 * jump_distance + 1, name="DistortionModel"),
                        distortion_model)
@@ -121,6 +160,55 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
                           lambda: tf.concat([tmp[i:, :], tf.zeros([i, max_time])], 0))
             shifting_matrices.append(tmp)
         self.shifting_matrices = tf.stack(shifting_matrices)
+
+    @property
+    def state_size(self):
+        return PatchedAttentionWrapperState(
+            cell_state=self._cell.state_size,
+            time=tensor_shape.TensorShape([]),
+            attention=self._attention_layer_size,
+            alignments=self._item_or_tuple(
+                a.alignments_size for a in self._attention_mechanisms),
+            alignment_history=self._item_or_tuple(
+                () for _ in self._attention_mechanisms),
+            contexts=self._item_or_tuple(
+                a.alignments_size for a in self._attention_mechanisms))  # sometimes a TensorArray
+
+    def zero_state(self, batch_size, dtype):
+        with ops.name_scope(type(self).__name__ + "ZeroState", values=[batch_size]):
+            if self._initial_cell_state is not None:
+                cell_state = self._initial_cell_state
+            else:
+                cell_state = self._cell.zero_state(batch_size, dtype)
+            error_message = (
+                "When calling zero_state of AttentionWrapper %s: " % self._base_name +
+                "Non-matching batch sizes between the memory "
+                "(encoder output) and the requested batch size.  Are you using "
+                "the BeamSearchDecoder?  If so, make sure your encoder output has "
+                "been tiled to beam_width via tf.contrib.seq2seq.tile_batch, and "
+                "the batch_size= argument passed to zero_state is "
+                "batch_size * beam_width.")
+            with ops.control_dependencies(
+                    self._batch_size_checks(batch_size, error_message)):
+                cell_state = nest.map_structure(
+                    lambda s: array_ops.identity(s, name="checked_cell_state"),
+                    cell_state)
+            return PatchedAttentionWrapperState(
+                cell_state=cell_state,
+                time=array_ops.zeros([], dtype=dtypes.int32),
+                attention=_zero_state_tensors(self._attention_layer_size, batch_size,
+                                              dtype),
+                alignments=self._item_or_tuple(
+                    attention_mechanism.initial_alignments(batch_size, dtype)
+                    for attention_mechanism in self._attention_mechanisms),
+                alignment_history=self._item_or_tuple(
+                    tensor_array_ops.TensorArray(dtype=dtype, size=0,
+                                                 dynamic_size=True)
+                    if self._alignment_history else ()
+                    for _ in self._attention_mechanisms),
+                contexts=self._item_or_tuple(
+                    _zero_state_tensors(a.alignments_size, batch_size, dtype)
+                    for a in self._attention_mechanisms))
 
     def call(self, inputs, state):
         """Perform a step of attention-wrapped RNN.
@@ -147,8 +235,8 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         Raises:
           TypeError: If `state` is not an instance of `AttentionWrapperState`.
         """
-        if not isinstance(state, attention_wrapper.AttentionWrapperState):
-            raise TypeError("Expected state to be instance of AttentionWrapperState. "
+        if not isinstance(state, PatchedAttentionWrapperState):
+            raise TypeError("Expected state to be instance of PatchedAttentionWrapperState. "
                             "Received type %s instead." % type(state))
 
         # Step 1: Calculate the true inputs to the cell based on the
@@ -183,10 +271,15 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         all_histories = []
         all_contexts = []
         for i, attention_mechanism in enumerate(self._attention_mechanisms):
-            if self.dmodel[1] == "source":
+            if self.dmodel[1] == "source" or self.dmodel[1] == "attention":
                 distortion_output = self.dmodel[0](state.attention)
             elif self.dmodel[1] == "hidden":
                 distortion_output = self.dmodel[0](state.cell_state[-1].h)
+            elif self.dmodel[1] == "context":
+                distortion_output = self.dmodel[0](state.contexts[i])
+            elif self.dmodel[1] == "target":
+                distortion_output = self.dmodel[0](inputs)
+
             distortion_output = tf.transpose(tf.nn.softmax(distortion_output)) # should be [7, batch]
 
             distorted_alignments = tf.scan(lambda a,t :
@@ -209,13 +302,13 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
             all_contexts.append(context)
 
         attention = array_ops.concat(all_attentions, 1)
-        context = array_ops.concat(all_contexts, 1)
-        next_state = attention_wrapper.AttentionWrapperState(
+        next_state = PatchedAttentionWrapperState(
             time=state.time + 1,
             cell_state=next_cell_state,
             attention=attention,
             alignments=self._item_or_tuple(all_alignments),
-            alignment_history=self._item_or_tuple(all_histories))
+            alignment_history=self._item_or_tuple(all_histories),
+            contexts=self._item_or_tuple(all_contexts))
 
         if self._output_attention:
             return attention, next_state
