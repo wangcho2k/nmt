@@ -90,6 +90,8 @@ def add_arguments(parser):
                       """)
   parser.add_argument("--distortion_distance",
                       type=int, default=3, help="Jump distance for distortion model.")
+  parser.add_argument("--distortion_lambda",
+                      type=float, default=0.5, help="Lambda parameter for distortion model")
 
   # optimizer
   parser.add_argument("--optimizer", type=str, default="sgd", help="sgd | adam")
@@ -264,6 +266,7 @@ def create_hparams(flags):
       pass_hidden_state=flags.pass_hidden_state,
       distortion_model=flags.distortion_model,
       distortion_distance=flags.distortion_distance,
+      distortion_lambda=flags.distortion_lambda,
 
       # Train
       optimizer=flags.optimizer,

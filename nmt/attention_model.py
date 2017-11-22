@@ -118,6 +118,7 @@ class AttentionModel(model.Model):
             attention_mechanism,
             hparams.distortion_model,
             hparams.distortion_distance,
+            hparams.distortion_lambda,
             attention_layer_size=num_units,
             alignment_history=alignment_history,
             name="attention_with_distortion")

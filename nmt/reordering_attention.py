@@ -26,15 +26,18 @@ from __future__ import print_function
 
 import tensorflow as tf
 import collections
+import math
 
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import dtypes
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import rnn_cell_impl
 from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.layers import core as layers_core
+from tensorflow.python.ops import variable_scope
 from tensorflow.contrib.seq2seq.python.ops import attention_wrapper
 from tensorflow.python.util import nest
 
@@ -42,7 +45,7 @@ _zero_state_tensors = rnn_cell_impl._zero_state_tensors  # pylint: disable=prote
 
 def _compute_attention_with_distortion(attention_mechanism, cell_output,
                                        previous_alignments, attention_layer,
-                                       distorted_alignments):
+                                       distorted_alignments, d_lambda):
     """
     Computes the attention and alignments for a given attention_mechanism
     with distorted alignments.
@@ -51,7 +54,7 @@ def _compute_attention_with_distortion(attention_mechanism, cell_output,
       cell_output, previous_alignments=previous_alignments)
     with tf.control_dependencies([
         tf.assert_equal(tf.shape(alignments),tf.shape(distorted_alignments[-1,:,:]))]):
-        alignments = 0.5*alignments + 0.5*distorted_alignments[-1,:,:]
+        alignments = (1-d_lambda)*alignments + d_lambda*distorted_alignments[-1,:,:]
 
     # Reshape from [batch_size, memory_time] to [batch_size, 1, memory_time]
     expanded_alignments = array_ops.expand_dims(alignments, 1)
@@ -118,6 +121,7 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
                attention_mechanism,
                distortion_model,
                jump_distance,
+               distortion_lambda=0.5,
                attention_layer_size=None,
                alignment_history=False,
                cell_input_fn=None,
@@ -135,12 +139,15 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
             initial_cell_state=initial_cell_state,
             name=name)
         self.jump_distance = jump_distance
+        self.distortion_lambda = distortion_lambda
 
         # creating distortion model
         if distortion_model != "source" and distortion_model != "hidden" and \
                         distortion_model != "target" and distortion_model != "context":
             raise ValueError("Unknown distortion model %s" % distortion_model)
-        self.dmodel = (layers_core.Dense(units=2 * jump_distance + 1, name="DistortionModel"),
+        #dmodel = layers_core.Dense(units=2 * jump_distance + 1, name="DistortionModel")
+        dmodel = None
+        self.dmodel = (dmodel,
                        distortion_model)
 
         # creating shifting matrix
@@ -270,17 +277,36 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
         all_attentions = []
         all_histories = []
         all_contexts = []
+
+        dtype = state.attention.dtype
+        num_jumps = 2 * self.jump_distance + 1
+        num_units = state.attention.get_shape().as_list()[-1]
+        w = variable_scope.get_variable(
+            "distortion_w", [num_units, num_jumps], dtype=dtype)
+        g = variable_scope.get_variable(
+            "distortion_g", dtype=dtype, initializer=math.sqrt((1. / num_jumps)))
+        b = variable_scope.get_variable(
+            "distortion_b", [num_jumps], dtype=dtype,
+            initializer=init_ops.zeros_initializer())
+
         for i, attention_mechanism in enumerate(self._attention_mechanisms):
             if self.dmodel[1] == "source" or self.dmodel[1] == "attention":
-                distortion_output = self.dmodel[0](state.attention)
+                # self.dmodel[0](state.attention)
+                distortion_input = state.attention
             elif self.dmodel[1] == "hidden":
-                distortion_output = self.dmodel[0](state.cell_state[-1].h)
+                distortion_input = state.cell_state[-1].h
             elif self.dmodel[1] == "context":
-                distortion_output = self.dmodel[0](state.contexts[i])
+                distortion_input = state.contexts[i]
             elif self.dmodel[1] == "target":
-                distortion_output = self.dmodel[0](inputs)
+                distortion_input = inputs
 
-            distortion_output = tf.transpose(tf.nn.softmax(distortion_output)) # should be [7, batch]
+            # normed_v = g * v / ||v||
+            normed_w = g * w * math_ops.rsqrt(
+                math_ops.reduce_sum(math_ops.square(w)))
+
+            distortion_output = tf.matmul(distortion_input, normed_w) + b
+
+            distortion_output = tf.transpose(tf.nn.softmax(distortion_output)) # should be [num_jumps, batch]
 
             distorted_alignments = tf.scan(lambda a,t :
                                            a+tf.transpose(t[1]*tf.transpose(tf.matmul(previous_alignments[i],t[0]))),
@@ -290,7 +316,7 @@ class ReorderingAttentionWrapper(attention_wrapper.AttentionWrapper):
             attention, alignments, context = _compute_attention_with_distortion(
                 attention_mechanism, cell_output, previous_alignments[i],
                 self._attention_layers[i] if self._attention_layers else None,
-                distorted_alignments)
+                distorted_alignments, self.distortion_lambda)
             alignment_history = previous_alignment_history[i].write(
                 state.time, alignments) if self._alignment_history else ()
 
